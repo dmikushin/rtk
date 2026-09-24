@@ -226,9 +226,38 @@ pub fn ok_confirmation(action: &str, detail: &str) -> String {
     }
 }
 
+/// The signal a writer gets when its reader closes the pipe. `cmd | head -5`
+/// ends this way every time and it is not an error.
+#[cfg(unix)]
+const SIGPIPE: i32 = 13;
+
+/// Is a SIGPIPE from the child explained by rtk's own situation?
+///
+/// Only when rtk's stdout is itself a pipe, because only then is there a reader
+/// downstream that could have closed early — which is the whole of `cmd | head`.
+/// When rtk's stdout is a file or a terminal there is no pipe of ours to blame,
+/// and a child dying of SIGPIPE is telling us something.
+///
+/// Asked through `/proc/self/fd/1` rather than `fstat`, because this crate
+/// forbids `unsafe` and the stdlib has no safe way to stat a borrowed
+/// descriptor. `std::fs::metadata` follows the link and reports the pipe
+/// itself; without /proc it answers "not a pipe", which errs towards reporting.
+#[cfg(unix)]
+fn stdout_is_a_pipe() -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    std::fs::metadata("/proc/self/fd/1")
+        .map(|m| m.file_type().is_fifo())
+        .unwrap_or(false)
+}
+
 /// Extract exit code from a process output. Returns the actual exit code, or
 /// `128 + signal` per Unix convention when terminated by a signal (no exit code
 /// available). Falls back to 1 on non-Unix platforms.
+///
+/// SIGPIPE IS reported here, unlike in `exit_code_from_status`, and the reason
+/// is causal. `.output()` gives the child a pipe whose only reader is rtk
+/// itself, so a downstream `head` closing cannot reach it; a SIGPIPE arriving
+/// here came from the child's own plumbing or from someone sending it.
 pub fn exit_code_from_output(output: &std::process::Output, label: &str) -> i32 {
     match output.status.code() {
         Some(code) => code,
@@ -250,6 +279,13 @@ pub fn exit_code_from_output(output: &std::process::Output, label: &str) -> i32 
 /// Extract exit code from an ExitStatus (for `.status()` calls, not `.output()`).
 /// Returns the actual exit code, or `128 + signal` per Unix convention when
 /// terminated by a signal. Falls back to 1 on non-Unix platforms.
+///
+/// This is the inherited-stdout path: the child writes to the descriptor rtk
+/// does. When that descriptor is a pipe, a downstream reader closing it is what
+/// `rtk git diff | head -20` does every time, and a shell passes over it in
+/// silence. Announcing it put `[rtk] …: process terminated by signal 13` above a
+/// correct result and sent readers looking for a fault that was not there. The
+/// exit code still carries the signal either way.
 pub fn exit_code_from_status(status: &std::process::ExitStatus, label: &str) -> i32 {
     match status.code() {
         Some(code) => code,
@@ -258,7 +294,9 @@ pub fn exit_code_from_status(status: &std::process::ExitStatus, label: &str) -> 
             {
                 use std::os::unix::process::ExitStatusExt;
                 if let Some(sig) = status.signal() {
-                    eprintln!("[rtk] {}: process terminated by signal {}", label, sig);
+                    if sig != SIGPIPE || !stdout_is_a_pipe() {
+                        eprintln!("[rtk] {}: process terminated by signal {}", label, sig);
+                    }
                     return 128 + sig;
                 }
             }
