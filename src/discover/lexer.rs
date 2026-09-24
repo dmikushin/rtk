@@ -201,6 +201,15 @@ pub fn tokenize(input: &str) -> Vec<ParsedToken> {
                         val.push(nc);
                         byte_pos += nc.len_utf8();
                     }
+                } else if chars.peek() == Some(&'|') {
+                    // `>|` is one operator — the noclobber override — and not a
+                    // redirect followed by a pipe. Reading it as two put a space
+                    // between them on reassembly, and `ps > | out.txt` is a bash
+                    // syntax error. Predates the rewriter's safety rules; found
+                    // when a review went looking for ways past them.
+                    chars.next();
+                    byte_pos += 1;
+                    val.push('|');
                 }
                 tokens.push(ParsedToken {
                     kind: TokenKind::Redirect,
@@ -1029,5 +1038,35 @@ mod tests {
     fn test_split_on_operators_empty() {
         assert!(split_on_operators("", false).is_empty());
         assert!(split_on_operators("  ", true).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod noclobber_tests {
+    use super::*;
+
+    /// `>|` is one token. Read as `>` plus `|`, reassembly inserted a space and
+    /// produced `ps > | out.txt`, which bash refuses to parse.
+    #[test]
+    fn noclobber_override_is_a_single_redirect() {
+        let tokens = tokenize("ps aux >| out.txt");
+        assert!(
+            tokens
+                .iter()
+                .any(|t| t.kind == TokenKind::Redirect && t.value == ">|"),
+            "expected a single `>|` redirect token, got {:?}",
+            tokens.iter().map(|t| (&t.kind, &t.value)).collect::<Vec<_>>()
+        );
+        assert!(
+            !tokens.iter().any(|t| t.kind == TokenKind::Pipe),
+            "`>|` must not produce a Pipe token"
+        );
+    }
+
+    /// The control: a real pipe after a redirect target is still a pipe.
+    #[test]
+    fn a_genuine_pipe_after_a_redirect_still_lexes_as_one() {
+        let tokens = tokenize("ps aux 2>err.log | head -5");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Pipe));
     }
 }

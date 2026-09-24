@@ -1,7 +1,7 @@
 //! Detects whether RTK hooks are installed and warns if they are outdated.
 
 use super::constants::{
-    CLAUDE_DIR, CLAUDE_HOOK_COMMAND, HOOKS_SUBDIR, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE,
+    CLAUDE_DIR, CLAUDE_HOOK_COMMAND, HOOKS_SUBDIR, REWRITE_HOOK_FILE,
     SETTINGS_JSON,
 };
 use crate::core::constants::RTK_DATA_DIR;
@@ -70,20 +70,21 @@ fn binary_hook_registered(claude_dir: &std::path::Path) -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
-    let pre_tool_use = match root
-        .get("hooks")
-        .and_then(|h| h.get(PRE_TOOL_USE_KEY))
-        .and_then(|p| p.as_array())
-    {
-        Some(arr) => arr,
-        None => return false,
-    };
-    pre_tool_use
-        .iter()
-        .filter_map(|entry| entry.get("hooks")?.as_array())
-        .flatten()
-        .filter_map(|hook| hook.get("command")?.as_str())
-        .any(|cmd| cmd == CLAUDE_HOOK_COMMAND)
+    // Current installs live under PostToolUse; an older install's PreToolUse
+    // entry still means "registered" — seeing one is an upgrade, not a miss.
+    ["PostToolUse", "PreToolUse"].iter().any(|key| {
+        root.get("hooks")
+            .and_then(|h| h.get(key))
+            .and_then(|p| p.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|entry| entry.get("hooks")?.as_array())
+                    .flatten()
+                    .filter_map(|hook| hook.get("command")?.as_str())
+                    .any(|cmd| cmd == CLAUDE_HOOK_COMMAND)
+            })
+            .unwrap_or(false)
+    })
 }
 
 /// Check if the installed hook is missing or outdated, warn once per day.

@@ -33,8 +33,6 @@ use std::path::{Path, PathBuf};
 /// Target agent for hook installation.
 #[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]
 pub enum AgentTarget {
-    /// Claude Code (default)
-    Claude,
     /// Cursor Agent (editor and CLI)
     Cursor,
     /// Windsurf IDE (Cascade)
@@ -744,21 +742,7 @@ enum Commands {
         since: u64,
     },
 
-    /// Rewrite a raw command to its RTK equivalent (single source of truth for hooks)
-    ///
-    /// Exits 0 and prints the rewritten command if supported.
-    /// Exits 1 with no output if the command has no RTK equivalent.
-    ///
-    /// Used by Claude Code, Gemini CLI, and other LLM hooks:
-    ///   REWRITTEN=$(rtk rewrite "$CMD") || exit 0
-    Rewrite {
-        /// Raw command to rewrite (e.g. "git status", "cargo test && git push")
-        /// Accepts multiple args: `rtk rewrite ls -al` is equivalent to `rtk rewrite "ls -al"`
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-
-    /// Hook processors for LLM CLI tools (Gemini CLI, Copilot, etc.)
+    /// Hook processors for LLM CLI tools.
     Hook {
         #[command(subcommand)]
         command: HookCommands,
@@ -767,23 +751,10 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum HookCommands {
-    /// Process Claude Code PreToolUse hook (reads JSON from stdin)
-    Claude,
-    /// Process Cursor Agent hook (reads JSON from stdin)
-    Cursor,
-    /// Process Gemini CLI BeforeTool hook (reads JSON from stdin)
-    Gemini,
-    /// Process Copilot preToolUse hook (VS Code + Copilot CLI, reads JSON from stdin)
-    Copilot,
-    /// Check how a command would be rewritten by the hook engine (dry-run)
-    Check {
-        /// Target agent
-        #[arg(long, default_value = "claude")]
-        agent: String,
-        /// Command to check
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        command: Vec<String>,
-    },
+    /// Process a PostToolUse hook: condense the CAPTURED output the model
+    /// reads. The command has already run untouched, so files hold its real
+    /// bytes by construction — this replaces only the copy in the response.
+    PostToolUse,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2175,46 +2146,11 @@ fn run_cli() -> Result<i32> {
         }
 
         Commands::Hook { command } => match command {
-            HookCommands::Claude => {
-                hooks::hook_cmd::run_claude()?;
+            HookCommands::PostToolUse => {
+                hooks::post_tool_use_cmd::run()?;
                 0
-            }
-            HookCommands::Cursor => {
-                hooks::hook_cmd::run_cursor()?;
-                0
-            }
-            HookCommands::Gemini => {
-                hooks::hook_cmd::run_gemini()?;
-                0
-            }
-            HookCommands::Copilot => {
-                hooks::hook_cmd::run_copilot()?;
-                0
-            }
-            HookCommands::Check { agent: _, command } => {
-                use crate::discover::registry::rewrite_command;
-                let raw = command.join(" ");
-                let (excluded, transparent_prefixes) = crate::core::config::Config::load()
-                    .map(|c| (c.hooks.exclude_commands, c.hooks.transparent_prefixes))
-                    .unwrap_or_default();
-                match rewrite_command(&raw, &excluded, &transparent_prefixes) {
-                    Some(rewritten) => {
-                        println!("{}", rewritten);
-                        0
-                    }
-                    None => {
-                        eprintln!("No rewrite for: {}", raw);
-                        1
-                    }
-                }
             }
         },
-
-        Commands::Rewrite { args } => {
-            let cmd = args.join(" ");
-            hooks::rewrite_cmd::run(&cmd)?;
-            0
-        }
 
         Commands::Pipe {
             filter,
@@ -2829,70 +2765,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_hook_claude_parses() {
-        let cli = Cli::try_parse_from(["rtk", "hook", "claude"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::Hook {
-                command: HookCommands::Claude
-            }
-        ));
-    }
 
-    #[test]
-    fn test_hook_check_parses() {
-        let cli = Cli::try_parse_from(["rtk", "hook", "check", "git", "status"]).unwrap();
-        match cli.command {
-            Commands::Hook {
-                command: HookCommands::Check { agent, command },
-            } => {
-                assert_eq!(agent, "claude");
-                assert_eq!(command, vec!["git", "status"]);
-            }
-            _ => panic!("Expected Hook Check command"),
-        }
-    }
 
-    #[test]
-    fn test_hook_check_with_agent() {
-        let cli =
-            Cli::try_parse_from(["rtk", "hook", "check", "--agent", "gemini", "cargo", "test"])
-                .unwrap();
-        match cli.command {
-            Commands::Hook {
-                command: HookCommands::Check { agent, command },
-            } => {
-                assert_eq!(agent, "gemini");
-                assert_eq!(command, vec!["cargo", "test"]);
-            }
-            _ => panic!("Expected Hook Check command"),
-        }
-    }
 
-    #[test]
-    fn test_hook_check_preserves_double_dash_in_command() {
-        let cli = Cli::try_parse_from([
-            "rtk",
-            "hook",
-            "check",
-            "shadowenv",
-            "exec",
-            "--",
-            "git",
-            "status",
-        ])
-        .unwrap();
-        match cli.command {
-            Commands::Hook {
-                command: HookCommands::Check { agent, command },
-            } => {
-                assert_eq!(agent, "claude");
-                assert_eq!(command, vec!["shadowenv", "exec", "--", "git", "status"]);
-            }
-            _ => panic!("Expected Hook Check command"),
-        }
-    }
 
     #[test]
     fn test_meta_command_list_is_complete() {
@@ -2953,52 +2828,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    #[test]
-    fn test_rewrite_clap_multi_args() {
-        // This is the bug KuSh reported: `rtk rewrite ls -al` failed because
-        // Clap rejected `-al` as an unknown flag. With trailing_var_arg + allow_hyphen_values,
-        // multiple args are accepted and joined into a single command string.
-        let cases = vec![
-            vec!["rtk", "rewrite", "ls", "-al"],
-            vec!["rtk", "rewrite", "git", "status"],
-            vec!["rtk", "rewrite", "npm", "exec"],
-            vec!["rtk", "rewrite", "cargo", "test"],
-            vec!["rtk", "rewrite", "du", "-sh", "."],
-            vec!["rtk", "rewrite", "head", "-50", "file.txt"],
-        ];
-        for args in &cases {
-            let result = Cli::try_parse_from(args.iter());
-            assert!(
-                result.is_ok(),
-                "rtk rewrite {:?} should parse (was failing before trailing_var_arg fix)",
-                &args[2..]
-            );
-            if let Ok(cli) = result {
-                match cli.command {
-                    Commands::Rewrite { ref args } => {
-                        assert!(args.len() >= 2, "rewrite args should capture all tokens");
-                    }
-                    _ => panic!("expected Rewrite command"),
-                }
-            }
-        }
-    }
 
-    #[test]
-    fn test_rewrite_clap_quoted_single_arg() {
-        // Quoted form: `rtk rewrite "git status"` — single arg containing spaces
-        let result = Cli::try_parse_from(["rtk", "rewrite", "git status"]);
-        assert!(result.is_ok());
-        if let Ok(cli) = result {
-            match cli.command {
-                Commands::Rewrite { ref args } => {
-                    assert_eq!(args.len(), 1);
-                    assert_eq!(args[0], "git status");
-                }
-                _ => panic!("expected Rewrite command"),
-            }
-        }
-    }
 
     #[test]
     fn test_merge_filters_with_no_args() {

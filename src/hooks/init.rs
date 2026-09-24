@@ -16,7 +16,7 @@ use super::constants::{
     GEMINI_HOOK_FILE, HERMES_DIR, HERMES_PLUGINS_SUBDIR, HERMES_PLUGIN_INIT_FILE,
     HERMES_PLUGIN_MANIFEST_FILE, HERMES_PLUGIN_NAME, HOOKS_JSON, HOOKS_SUBDIR,
     PI_CODING_AGENT_DIR_ENV, PI_DIR, PI_EXTENSIONS_SUBDIR, PI_LOCAL_DIR, PI_PLUGIN_FILE,
-    PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON,
+    POST_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON,
 };
 use super::integrity;
 
@@ -515,35 +515,41 @@ fn print_manual_instructions(hook_command: &str, include_opencode: bool) {
 }
 
 fn remove_hook_from_json(root: &mut serde_json::Value) -> bool {
-    let hooks = match root
-        .get_mut("hooks")
-        .and_then(|h| h.get_mut(PRE_TOOL_USE_KEY))
-    {
-        Some(pre_tool_use) => pre_tool_use,
-        None => return false,
-    };
-
-    let pre_tool_use_array = match hooks.as_array_mut() {
-        Some(arr) => arr,
-        None => return false,
-    };
-
-    let original_len = pre_tool_use_array.len();
-    pre_tool_use_array.retain(|entry| {
-        if let Some(hooks_array) = entry.get("hooks").and_then(|h| h.as_array()) {
-            for hook in hooks_array {
-                if let Some(command) = hook.get("command").and_then(|c| c.as_str()) {
-                    // Match both legacy script path and new binary command
-                    if command.contains(REWRITE_HOOK_FILE) || command == CLAUDE_HOOK_COMMAND {
-                        return false;
+    // Both lists, because an install's entry sits in whichever list was current
+    // when it ran: PostToolUse now, PreToolUse before the rewrite layer was
+    // deleted. An uninstall that leaves the old entry behind is not an
+    // uninstall.
+    //
+    // The retired `rtk hook claude` command is removed alongside the script
+    // and the current command: all three are rtk.
+    const KEYS: &[&str] = &["PostToolUse", "PreToolUse"];
+    let mut removed_any = false;
+    for key in KEYS {
+        let Some(hooks) = root.get_mut("hooks").and_then(|h| h.get_mut(*key)) else {
+            continue;
+        };
+        let Some(arr) = hooks.as_array_mut() else {
+            continue;
+        };
+        let original_len = arr.len();
+        arr.retain(|entry| {
+            if let Some(hooks_array) = entry.get("hooks").and_then(|h| h.as_array()) {
+                for hook in hooks_array {
+                    if let Some(command) = hook.get("command").and_then(|c| c.as_str()) {
+                        if command.contains(REWRITE_HOOK_FILE)
+                            || command == CLAUDE_HOOK_COMMAND
+                            || command == "rtk hook claude"
+                        {
+                            return false;
+                        }
                     }
                 }
             }
-        }
-        true
-    });
-
-    pre_tool_use_array.len() < original_len
+            true
+        });
+        removed_any |= arr.len() < original_len;
+    }
+    removed_any
 }
 
 /// Remove RTK hook from settings.json file
@@ -1066,13 +1072,13 @@ fn insert_hook_entry(root: &mut serde_json::Value, hook_command: &str) -> Result
         .as_object_mut()
         .context("hooks value is not an object")?;
 
-    let pre_tool_use = hooks
-        .entry(PRE_TOOL_USE_KEY)
+    let post_tool_use = hooks
+        .entry(POST_TOOL_USE_KEY)
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut()
-        .context("PreToolUse value is not an array")?;
+        .context("PostToolUse value is not an array")?;
 
-    pre_tool_use.push(serde_json::json!({
+    post_tool_use.push(serde_json::json!({
         "matcher": "Bash",
         "hooks": [{
             "type": "command",
@@ -1082,26 +1088,32 @@ fn insert_hook_entry(root: &mut serde_json::Value, hook_command: &str) -> Result
     Ok(())
 }
 
-/// Check if RTK hook is already present in settings.json
-/// Matches on legacy rtk-rewrite.sh path OR new `rtk hook claude` command
+/// Check if the RTK hook is already present in settings.json.
+/// Matches the current `rtk hook post-tool-use` command, the retired
+/// `rtk hook claude` rewriter, and the legacy rtk-rewrite.sh script — all three
+/// mean "rtk is wired up", and finding an old one is an upgrade, not a duplicate.
 fn hook_already_present(root: &serde_json::Value, hook_command: &str) -> bool {
-    let pre_tool_use_array = match root
-        .get("hooks")
-        .and_then(|h| h.get(PRE_TOOL_USE_KEY))
-        .and_then(|p| p.as_array())
-    {
-        Some(arr) => arr,
-        None => return false,
-    };
-
-    pre_tool_use_array
-        .iter()
-        .filter_map(|entry| entry.get("hooks")?.as_array())
-        .flatten()
-        .filter_map(|hook| hook.get("command")?.as_str())
-        .any(|cmd| {
-            cmd == hook_command || cmd == CLAUDE_HOOK_COMMAND || cmd.contains(REWRITE_HOOK_FILE)
-        })
+    // BOTH lists, and the comment used to say so while the code read only
+    // PreToolUse — so a freshly installed PostToolUse entry was invisible and a
+    // second `rtk init` duplicated it, while a stale PreToolUse entry pointing
+    // at a deleted script counted as a working install. A reviewer caught the
+    // disagreement between the comment and the code.
+    ["PostToolUse", "PreToolUse"].iter().any(|key| {
+        root.get("hooks")
+            .and_then(|h| h.get(*key))
+            .and_then(|p| p.as_array())
+            .is_some_and(|arr| {
+                arr.iter()
+                    .filter_map(|entry| entry.get("hooks")?.as_array())
+                    .flatten()
+                    .filter_map(|hook| hook.get("command")?.as_str())
+                    .any(|cmd| {
+                        cmd == hook_command
+                            || cmd == CLAUDE_HOOK_COMMAND
+                            || cmd.contains(REWRITE_HOOK_FILE)
+                    })
+            })
+    })
 }
 
 /// Default mode: hook + slim RTK.md + @RTK.md reference
@@ -1304,13 +1316,16 @@ fn remove_legacy_settings_entries(ctx: InitContext) -> Result<()> {
     Ok(())
 }
 
-/// Remove only legacy `rtk-rewrite.sh` hook entries from a parsed settings.json.
+/// Remove legacy `rtk-rewrite.sh` hook entries from a parsed settings.json.
 /// Returns true if any entries were removed.
-/// Does NOT remove `rtk hook claude` entries — those are the new format.
+///
+/// They live under PreToolUse — that is what the retired layer installed — and
+/// this looked under PostToolUse, so the entry survived every upgrade while
+/// pointing at a script the upgrade had just deleted.
 fn remove_legacy_hook_entries_from_json(root: &mut serde_json::Value) -> bool {
     let pre_tool_use_array = match root
         .get_mut("hooks")
-        .and_then(|h| h.get_mut(PRE_TOOL_USE_KEY))
+        .and_then(|h| h.get_mut("PreToolUse"))
         .and_then(|p| p.as_array_mut())
     {
         Some(arr) => arr,
@@ -5055,18 +5070,19 @@ mod tests {
 
         insert_hook_entry(&mut json_content, hook_command).unwrap();
 
-        // Should create full structure
+        // Should create full structure under PostToolUse — the old layer's
+        // PreToolUse entry is gone with the layer itself.
         assert!(json_content.get("hooks").is_some());
         assert!(json_content
             .get("hooks")
             .unwrap()
-            .get("PreToolUse")
+            .get("PostToolUse")
             .is_some());
 
-        let pre_tool_use = json_content["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(pre_tool_use.len(), 1);
+        let post_tool_use = json_content["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(post_tool_use.len(), 1);
 
-        let command = pre_tool_use[0]["hooks"][0]["command"].as_str().unwrap();
+        let command = post_tool_use[0]["hooks"][0]["command"].as_str().unwrap();
         assert_eq!(command, hook_command);
     }
 
@@ -5074,7 +5090,7 @@ mod tests {
     fn test_insert_hook_entry_preserves_existing() {
         let mut json_content = serde_json::json!({
             "hooks": {
-                "PreToolUse": [{
+                "PostToolUse": [{
                     "matcher": "Bash",
                     "hooks": [{
                         "type": "command",
@@ -5087,15 +5103,15 @@ mod tests {
         let hook_command = "/Users/test/.claude/hooks/rtk-rewrite.sh";
         insert_hook_entry(&mut json_content, hook_command).unwrap();
 
-        let pre_tool_use = json_content["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(pre_tool_use.len(), 2); // Should have both hooks
+        let post_tool_use = json_content["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(post_tool_use.len(), 2); // Should have both hooks
 
         // Check first hook is preserved
-        let first_command = pre_tool_use[0]["hooks"][0]["command"].as_str().unwrap();
+        let first_command = post_tool_use[0]["hooks"][0]["command"].as_str().unwrap();
         assert_eq!(first_command, "/some/other/hook.sh");
 
         // Check second hook is RTK
-        let second_command = pre_tool_use[1]["hooks"][0]["command"].as_str().unwrap();
+        let second_command = post_tool_use[1]["hooks"][0]["command"].as_str().unwrap();
         assert_eq!(second_command, hook_command);
     }
 
@@ -5175,7 +5191,7 @@ mod tests {
     fn test_remove_hook_from_json() {
         let mut json_content = serde_json::json!({
             "hooks": {
-                "PreToolUse": [
+                "PostToolUse": [
                     {
                         "matcher": "Bash",
                         "hooks": [{
@@ -5198,19 +5214,36 @@ mod tests {
         assert!(removed);
 
         // Should have only one hook left
-        let pre_tool_use = json_content["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(pre_tool_use.len(), 1);
+        let post_tool_use = json_content["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(post_tool_use.len(), 1);
 
         // Check it's the other hook
-        let command = pre_tool_use[0]["hooks"][0]["command"].as_str().unwrap();
+        let command = post_tool_use[0]["hooks"][0]["command"].as_str().unwrap();
         assert_eq!(command, "/some/other/hook.sh");
+    }
+
+    /// An install from before the rewrite layer was deleted put its entry
+    /// under PreToolUse. Uninstalling must remove that too, or an upgrade
+    /// would leave a hook pointing at a subcommand that no longer exists.
+    #[test]
+    fn test_remove_hook_cleans_the_legacy_pre_tool_use_entry() {
+        let mut json_content = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{ "type": "command", "command": "rtk hook claude" }]
+                }]
+            }
+        });
+        assert!(remove_hook_from_json(&mut json_content));
+        assert!(json_content["hooks"].get("PreToolUse").unwrap().as_array().unwrap().is_empty());
     }
 
     #[test]
     fn test_remove_hook_from_json_new_command() {
         let mut json_content = serde_json::json!({
             "hooks": {
-                "PreToolUse": [
+                "PostToolUse": [
                     {
                         "matcher": "Bash",
                         "hooks": [{
@@ -5232,10 +5265,10 @@ mod tests {
         let removed = remove_hook_from_json(&mut json_content);
         assert!(removed);
 
-        let pre_tool_use = json_content["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(pre_tool_use.len(), 1);
+        let post_tool_use = json_content["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(post_tool_use.len(), 1);
         assert_eq!(
-            pre_tool_use[0]["hooks"][0]["command"].as_str().unwrap(),
+            post_tool_use[0]["hooks"][0]["command"].as_str().unwrap(),
             "/some/other/hook.sh"
         );
     }
