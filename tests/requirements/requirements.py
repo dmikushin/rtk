@@ -95,55 +95,59 @@ class Rtk:
             return command
         r = self._run(["rewrite", command])
         out = r.stdout.strip()
-        return out if r.returncode == 0 and out else command
+        # 0 and 3 both mean "use this"; 3 additionally asks the caller to
+        # confirm. Taking 3 for a refusal made the whole suite lie: every
+        # command came back unrewritten, so the file checks passed while
+        # testing nothing, and the shortening check failed while the build was
+        # in fact shortening. The client's own contract is the authority here
+        # (free-code src/utils/shell/bashProvider.ts:68).
+        return out if r.returncode in (0, 3) and out else command
 
-    def shorten(self, command: str, output: str) -> str | None:
-        """The model's copy of `output`, or None if this build leaves it alone.
+    def what_the_model_sees(self, command: str) -> tuple[str, str]:
+        """Run `command` the way this build would, and return (raw, seen).
 
-        Two ways to get there. A post-hook build is handed the captured result
-        and returns a replacement. A substituting build shortens by running a
-        different command, so the question is asked by running it and comparing.
+        `raw` is what the command prints when nothing interferes; `seen` is what
+        reaches the model. One primitive serves both designs, because the
+        question is about the result and not about where the shortening
+        happened: a substituting build shortens by running something else, a
+        post-hook build by replacing the captured text.
+
+        Both halves come from actually running something. An earlier version
+        handed the checks a synthetic output instead, and against a substituting
+        build that was meaningless — it compared text that nothing had printed,
+        so a sentinel counted as destroyed when it had simply never existed.
         """
+        raw = subprocess.run(["bash", "-c", command], capture_output=True,
+                             text=True, timeout=300).stdout
+        to_run = self.command_the_shell_will_run(command)
+        seen = subprocess.run(["bash", "-c", to_run], capture_output=True,
+                              text=True, timeout=300).stdout
         if self.has_post_hook:
-            payload = json.dumps(
-                {
-                    "tool_name": "Bash",
-                    "tool_input": {"command": command},
-                    "tool_response": {
-                        "stdout": output,
-                        "stderr": "",
-                        "interrupted": False,
-                        "isImage": False,
-                    },
-                }
-            )
-            r = subprocess.run(
-                [self.path, "hook", "post-tool-use"],
-                input=payload,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            if not r.stdout.strip():
-                return None
-            try:
-                doc = json.loads(r.stdout)
-            except json.JSONDecodeError:
-                return None
-            replaced = doc.get("hookSpecificOutput", {}).get("updatedToolOutput")
-            if isinstance(replaced, dict):
-                return replaced.get("stdout")
-            return replaced if isinstance(replaced, str) else None
+            replaced = self._post_hook(command, seen)
+            if replaced is not None:
+                seen = replaced
+        return raw, seen
 
-        if self.has_rewrite:
-            rewritten = self.command_the_shell_will_run(command)
-            if rewritten == command:
-                return None
-            r = subprocess.run(
-                ["bash", "-c", rewritten], capture_output=True, text=True, timeout=120
-            )
-            return r.stdout
-        return None
+    def _post_hook(self, command: str, output: str) -> str | None:
+        payload = json.dumps({
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "tool_response": {"stdout": output, "stderr": "",
+                              "interrupted": False, "isImage": False},
+        })
+        r = subprocess.run([self.path, "hook", "post-tool-use"], input=payload,
+                           capture_output=True, text=True, timeout=120)
+        if not r.stdout.strip():
+            return None
+        try:
+            doc = json.loads(r.stdout)
+        except json.JSONDecodeError:
+            return None
+        replaced = doc.get("hookSpecificOutput", {}).get("updatedToolOutput")
+        if isinstance(replaced, dict):
+            return replaced.get("stdout")
+        return replaced if isinstance(replaced, str) else None
+
 
 
 class Report:
@@ -288,23 +292,18 @@ def check_syntax_preserved(rtk: Rtk, rep: Report, workdir: str) -> None:
 
 def check_shortening_happens(rtk: Rtk, rep: Report, workdir: str) -> None:
     print("\nR3  a long output is still shortened for the model")
-    long_output = subprocess.run(["ps", "-eo", "pid,args"],
-                                 capture_output=True, text=True).stdout
-    original = len(long_output.splitlines())
+    raw, seen = rtk.what_the_model_sees("ps -eo pid,args")
+    original = len(raw.splitlines())
     if original < 50:
         rep.record("R3", "simple command", None,
                    f"only {original} processes on this machine; nothing to shorten")
         return
-    got = rtk.shorten("ps -eo pid,args", long_output)
-    if got is None:
+    got = len(seen.splitlines())
+    if got >= original:
         rep.record("R3", "simple command", False,
-                   f"{original} lines left unshortened — rtk is doing nothing")
-    elif len(got.splitlines()) >= original:
-        rep.record("R3", "simple command", False,
-                   f"{original} lines in, {len(got.splitlines())} out")
+                   f"{original} lines in, {got} out — rtk is doing nothing")
     else:
-        rep.record("R3", "simple command", True,
-                   f"{original} -> {len(got.splitlines())}")
+        rep.record("R3", "simple command", True, f"{original} -> {got}")
 
 
 # --------------------------------------------------------------------------
@@ -320,26 +319,26 @@ def check_shortening_happens(rtk: Rtk, rep: Report, workdir: str) -> None:
 
 def check_foreign_output_survives(rtk: Rtk, rep: Report, workdir: str) -> None:
     print("\nR4  shortening one command does not destroy another's output")
-    ps_out = subprocess.run(["ps", "-eo", "pid,args"],
-                            capture_output=True, text=True).stdout
-    sentinel = "".join(f"SENTINEL-{i:04d}\n" for i in range(400))
-
-    for label, command, combined in [
-        ("second command after ;", "ps -eo pid,args; echo done", ps_out + sentinel),
-        ("second command after &&", "ps -eo pid,args && echo done", ps_out + sentinel),
-    ]:
-        got = rtk.shorten(command, combined)
-        if got is None:
-            rep.record("R4", label, True, "left whole")
+    # The second command really prints these, so a missing sentinel means it
+    # was destroyed rather than never produced.
+    tail = "seq -f SENTINEL-%04g 0 399"
+    for label, joiner in [("second command after ;", ";"),
+                          ("second command after &&", "&&")]:
+        command = f"ps -eo pid,args {joiner} {tail}"
+        raw, seen = rtk.what_the_model_sees(command)
+        produced = sum(1 for l in raw.splitlines() if l.startswith("SENTINEL-"))
+        if produced != 400:
+            rep.record("R4", label, None,
+                       f"the fixture printed {produced} sentinels, not 400")
             continue
-        kept = sum(1 for line in got.splitlines() if line.startswith("SENTINEL-"))
-        if kept == 0:
-            rep.record("R4", label, False,
-                       f"all 400 lines of the second command's output were "
-                       f"destroyed ({len(combined.splitlines())} -> "
-                       f"{len(got.splitlines())} lines)")
+        kept = sum(1 for l in seen.splitlines() if l.startswith("SENTINEL-"))
+        if kept == 400:
+            rep.record("R4", label, True, "all 400 survived")
         else:
-            rep.record("R4", label, True, f"{kept}/400 sentinel lines survived")
+            rep.record("R4", label, False,
+                       f"{400 - kept} of 400 lines of the second command's "
+                       f"output were destroyed ({len(raw.splitlines())} -> "
+                       f"{len(seen.splitlines())} lines)")
 
 
 # --------------------------------------------------------------------------
